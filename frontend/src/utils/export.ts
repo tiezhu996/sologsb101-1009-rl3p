@@ -61,6 +61,7 @@ export function exportReadingCsv(
     '读数',
     '偏差率(%)',
     '判定',
+    '判定标准版本',
     '备注'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -69,22 +70,29 @@ export function exportReadingCsv(
     const patrol = patrols.find((item) => item.id === reading.patrolId)
     const device = point ? devices.find((item) => item.id === point.deviceId) : undefined
     const station = patrol ? stations.find((item) => item.id === patrol.stationId) : undefined
+    // 历史读数按冻结的当时标准导出，保证台账可追溯
+    const snapshot = reading.standardSnapshot
+    const standardMin = snapshot ? snapshot.standardMin : point ? point.standardMin : '—'
+    const standardMax = snapshot ? snapshot.standardMax : point ? point.standardMax : '—'
+    const unit = snapshot ? snapshot.unit : point ? point.unit : '—'
+    const isCritical = snapshot ? snapshot.isCritical : point ? point.isCritical : false
     lines.push(
       [
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
-        point ? point.standardMin : '—',
-        point ? point.standardMax : '—',
-        point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        standardMin,
+        standardMax,
+        unit,
+        point ? (isCritical ? '是' : '否') : '—',
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        abnormalLevelOf(reading.deviationPct, isCritical),
+        snapshot ? `标准 v${snapshot.version}` : '—',
         reading.note || '—'
       ]
         .map(csvCell)
@@ -98,12 +106,13 @@ export function exportReadingCsv(
 
 /** 泄漏处置台账 CSV */
 export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Leak[]): string {
-  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人']
+  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人', '派单标准版本']
   const lines: string[] = [header.map(csvCell).join(',')]
   leaks.forEach((leak) => {
     const device = devices.find((item) => item.id === leak.deviceId)
     const station = stations.find((item) => item.id === leak.stationId)
-    const pass = leak.retestValuePpm > 0 && leak.retestValuePpm <= 50
+    const passLimit = leak.standardSnapshot?.standardMax ?? 50
+    const pass = leak.retestValuePpm > 0 && leak.retestValuePpm <= passLimit
     lines.push(
       [
         station ? station.name : '—',
@@ -115,7 +124,8 @@ export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Lea
         leak.state,
         leak.retestValuePpm,
         leak.state === '已复检' ? (pass ? '合格' : '不合格') : '未复检',
-        leak.handler || '—'
+        leak.handler || '—',
+        leak.standardSnapshot ? `v${leak.standardSnapshot.version}` : '—'
       ]
         .map(csvCell)
         .join(',')

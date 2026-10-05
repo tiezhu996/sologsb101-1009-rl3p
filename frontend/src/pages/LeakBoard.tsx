@@ -5,6 +5,7 @@
  */
 import { useMemo, useState } from 'react'
 import {
+  Alert,
   Button,
   Form,
   Input,
@@ -22,7 +23,9 @@ import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
-import { useLeakStore } from '@/stores/leakStore'
+import { useLeakStore, type LeakCommitOutcome } from '@/stores/leakStore'
+import { useMergeStore } from '@/stores/mergeStore'
+import type { LeakRow } from '@/utils/db'
 import {
   EMPTY_LEAK_DRAFT,
   LEAK_RETEST_PASS_PPM,
@@ -35,9 +38,17 @@ import {
 } from '@/types/leak'
 import { deviationPctOf, formatLeakConcentration } from '@/utils/range'
 
+function describeLeakOutcome(outcome: LeakCommitOutcome, successText: string): void {
+  if (outcome.status === 'saved') Message.success(successText)
+  else if (outcome.status === 'conflict')
+    Message.warning('另一个标签页已先更新该处置单，本份已完整保留到「待处理中心」')
+  else Message.error('写入失败，内容已存入本地草稿，可在顶部「待处理中心」重试找回')
+}
+
 export default function LeakBoard() {
   const stationStore = useStationStore()
   const leakStore = useLeakStore()
+  const mergeStore = useMergeStore()
 
   const [form] = Form.useForm<LeakDraft>()
   const [treatForm] = Form.useForm<{ handler: string; measure: string }>()
@@ -120,13 +131,14 @@ export default function LeakBoard() {
     const values = await form.validate().catch(() => null)
     if (!values) return
     if (editingId) {
-      await leakStore.updateLeak(editingId, values)
-      Message.success('处置单已更新')
+      const outcome = await leakStore.updateLeak(editingId, values)
+      describeLeakOutcome(outcome, '处置单已更新')
+      if (outcome.status === 'saved') setFormOpen(false)
     } else {
       await leakStore.createLeak(values)
-      Message.success('处置单已创建')
+      Message.success('处置单已创建（派单时标准已冻结）')
+      setFormOpen(false)
     }
-    setFormOpen(false)
   }
 
   const remove = async (leak: Leak): Promise<void> => {
@@ -155,18 +167,28 @@ export default function LeakBoard() {
     if (!target) return
     const values = await treatForm.validate().catch(() => null)
     if (!values) return
-    await leakStore.advance(target.id, { handler: values.handler, measure: values.measure })
-    Message.success('处置措施已归档，状态置为「已处置」')
-    setTreatOpen(false)
+    const base = (leakStore.leaks.find((item) => item.id === target.id) as LeakRow | undefined)?.revision
+    const { outcome } = await leakStore.advance(
+      target.id,
+      { handler: values.handler, measure: values.measure },
+      base
+    )
+    describeLeakOutcome(outcome, '处置措施已归档，状态置为「已处置」')
+    if (outcome.status === 'saved') setTreatOpen(false)
   }
 
   const submitRetest = async (): Promise<void> => {
     if (!target) return
     const values = await retestForm.validate().catch(() => null)
     if (!values) return
-    const passed = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler)
-    if (passed) {
-      Message.success(`复检浓度 ${values.retestValuePpm} ppm ≤ ${LEAK_RETEST_PASS_PPM} ppm，判定合格，处置单已闭环`)
+    const base = (leakStore.leaks.find((item) => item.id === target.id) as LeakRow | undefined)?.revision
+    const outcome = await leakStore.submitRetest(target.id, values.retestValuePpm, values.handler, base)
+    if (outcome.status !== 'saved') {
+      describeLeakOutcome(outcome, '')
+      return
+    }
+    if (outcome.passed) {
+      Message.success(`复检浓度 ${values.retestValuePpm} ppm ≤ ${LEAK_RETEST_PASS_PPM} ppm，判定合格，处置单已闭环（历史判定标准不变）`)
     } else {
       Message.warning(`复检浓度 ${values.retestValuePpm} ppm 仍超标，处置单已复检但仍需继续整改`)
     }
@@ -184,14 +206,19 @@ export default function LeakBoard() {
       }
     },
     {
-      title: '泄漏浓度',
-      width: 200,
+      title: '泄漏浓度 / 判定标准',
+      width: 240,
       render: (_value, record) => (
-        <Space size={6}>
-          <span style={{ color: '#f53f3f', fontWeight: 600 }}>{formatLeakConcentration(record.concentrationPpm)}</span>
-          <Tag color="red" size="small">
-            偏差 {deviationPctOf(record.concentrationPpm, 0, 50).toFixed(0)}%
-          </Tag>
+        <Space size={6} direction="vertical" style={{ gap: 2 }}>
+          <Space size={6}>
+            <span style={{ color: '#f53f3f', fontWeight: 600 }}>{formatLeakConcentration(record.concentrationPpm)}</span>
+            <Tag color="red" size="small">
+              偏差 {deviationPctOf(record.concentrationPpm, record.standardSnapshot?.standardMin ?? 0, record.standardSnapshot?.standardMax ?? 50).toFixed(0)}%
+            </Tag>
+          </Space>
+          <span className="muted" style={{ fontSize: 12 }}>
+            派单标准 v{record.standardSnapshot?.version ?? '—'}：0 ~ {record.standardSnapshot?.standardMax ?? 50} ppm（后来的标准不改判本单）
+          </span>
         </Space>
       )
     },
@@ -274,6 +301,16 @@ export default function LeakBoard() {
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索设备型号 / 编号 / 处置人" onModelChange={onModelChange} />
+
+      {mergeStore.pendingMerges.filter((item) => item.status === '待合并' && item.type === 'leak').length > 0 ? (
+        <Alert
+          type="warning"
+          style={{ marginTop: 12 }}
+          content={`有 ${
+            mergeStore.pendingMerges.filter((item) => item.status === '待合并' && item.type === 'leak').length
+          } 张处置单存在并发提交待合并，先写入者已生效，另一份在顶部「待处理中心」可继续处理。`}
+        />
+      ) : null}
 
       <div className="panel" style={{ marginTop: 16 }}>
         <div className="panel-head">

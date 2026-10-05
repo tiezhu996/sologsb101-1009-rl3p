@@ -1,4 +1,6 @@
 /** 泄漏处置：由异常读数派发的处置单，复检合格后闭环 */
+import type { StandardSnapshot } from '@/types/point'
+
 export type LeakState = '待处置' | '已处置' | '已复检'
 
 export interface Leak {
@@ -15,6 +17,11 @@ export interface Leak {
   /** 复检浓度（ppm） */
   retestValuePpm: number
   handler: string
+  /**
+   * 派单时的标准快照：泄漏处置单按当时标准判异常，
+   * 后续点位标准升级不能改判历史处置单。
+   */
+  standardSnapshot: StandardSnapshot | null
   createdAt: number
   updatedAt: number
 }

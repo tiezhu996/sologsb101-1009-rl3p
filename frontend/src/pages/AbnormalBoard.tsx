@@ -90,9 +90,11 @@ export default function AbnormalBoard() {
         foundTime,
         measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
           station ? station.name : ''
-        } 已派发处置单`
+        } 已派发处置单`,
+        pointId: point.id,
+        standardVersion: row.reading.standardSnapshot?.version ?? point.standardVersion
       })
-      Message.success('已派发泄漏处置单')
+      Message.success('已派发泄漏处置单（按该读数当时标准冻结，后续改标不影响此单）')
       return
     }
     await patrolStore.saveSingleReading(row.reading.patrolId, point, row.reading.value, '异常已确认并记录')
@@ -115,7 +117,9 @@ export default function AbnormalBoard() {
           stationId: row.point.stationId,
           concentrationPpm: row.reading.value,
           foundTime: row.patrol ? row.patrol.patrolDate || row.patrol.planDate : new Date().toISOString().slice(0, 10),
-          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`
+          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`,
+          pointId: row.point.id,
+          standardVersion: row.reading.standardSnapshot?.version ?? row.point.standardVersion
         })
         leakCount += 1
       } else {
@@ -143,7 +147,7 @@ export default function AbnormalBoard() {
       Number(values.value),
       values.note
     )
-    Message.success('读数已修正，偏差率与异常级别已重算')
+    Message.success('读数已修正，偏差率按该巡检适用标准重算')
     setFixOpen(false)
   }
 
@@ -174,10 +178,14 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '判定标准（当时冻结）',
+      width: 200,
       render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+        record.reading.standardSnapshot
+          ? `v${record.reading.standardSnapshot.version} · ${record.reading.standardSnapshot.standardMin} ~ ${record.reading.standardSnapshot.standardMax} ${record.reading.standardSnapshot.unit}`
+          : record.point
+            ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}`
+            : '—'
     },
     {
       title: '读数',

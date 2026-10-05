@@ -70,7 +70,7 @@ sologsb101-1009/
 | 路由 | 页面 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
 | `/stations` | 调压站与设备台账 | Station、Device | 新建/编辑/删除站点与设备；按压力等级与设备类型筛选；卡片回显设备数、待处置泄漏数与漏检次数 |
-| `/points` | 巡检点位与标准值配置 | Point、Device | 维护点位上下限/单位/关键点标记（草稿 → 逐条/批量提交并重算历史读数）；按模板批量复制标准值 |
+| `/points` | 巡检点位与标准值配置 | Point、PointStandardVersion、Device | 维护点位上下限/单位/关键点标记（草稿 → 发新版本，标准可追溯；历史读数不重算，未提交草稿标待复核）；按模板批量复制标准值；查看版本档案 |
 | `/patrols` | 巡检录入 | Patrol、Reading、Point | 选定任务后逐点录入读数，实时偏差率与异常级别；逐点或整批保存；完成巡检、标记漏检、现场备注 |
 | `/abnormal` | 异常判定与分级 | Reading、Point | 按关键点权重降序排列；勾选批量确认；浓度类点位一键派发泄漏处置单 |
 | `/leaks` | 泄漏处置单与复检闭环 | Leak、Device、Reading | 派单 → 填写处置措施与处置人 → 录入复检浓度判合格闭环；导出处置台账 CSV |
@@ -79,10 +79,20 @@ sologsb101-1009/
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbgaspress`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`stations`、`devices`、`points`、`patrols`、`readings`、`leaks`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属设备回填点位与处置单的 `stationId` 冗余列、按标准区间重算历史读数 `deviationPct` / `isAbnormal`）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座调压站 → 5 台设备 → 11 个点位 → 6 次巡检 → 11 条读数 → 3 张泄漏处置单的完整父子孙链条；播种幂等
-- **localStorage 辅助键**：`gbgaspress:db-version`、`gbgaspress:last-backup-at`、`gbgaspress:ui-prefs`
+- **对象表**：`stations`、`devices`、`points`、`pointStandards`（点位标准版本档案）、`patrols`、`readings`、`leaks`、`pendingMerges`（并发提交待合并）
+- **数据结构版本**：`DB_VERSION = 3`
+  - `version(1)` → `version(2)`：补齐 `revision`、回填点位/处置单 `stationId` 冗余列
+  - `version(2)` → `version(3)`：点位标准值**版本化**（每个点位补建 v1 基线档案）；读数与泄漏处置单冻结产生时的 `standardSnapshot`；新增待合并队列表
+- **标准值版本化口径（升级期后台改标 + 现场录数并发）**
+  - 标准值修改生成可追溯的新版本（`pointStandards` 记录版本号、区间、关键点、变更原因与生效时间），页面上可查看每个点位的版本档案
+  - **新标准只管尚未提交的巡检**：读数保存时按点位当前标准冻结快照；已完成巡检的历史读数永远按当时标准标记异常，之后的标准不回改
+  - 已派发的**泄漏处置单**冻结派单时标准，后来的标准不能改判历史处置单
+  - 巡检录入草稿遇到标准更新会被标为**待复核**：保留录入原值、旧偏差/旧判定，并展示与新标准的差异，需人工「复核保留原值」或按新标准重录后才能提交
+  - 读数草稿持久化在 localStorage（`gbgaspress:reading-drafts`），重开浏览器可继续录入
+- **并发提交（多标签页）**：巡检/处置单按行版本号（`revision`）乐观锁，两个标签页同时提交同一记录时**先写入者生效**，后写入者的**完整载荷**进入 `pendingMerges` 待合并队列；顶部「待处理中心」可重新应用、强制覆盖或放弃，重开页面后仍可继续处理
+- **写入失败找回**：IndexedDB 写入异常（非版本冲突）的载荷进入本地待恢复区（localStorage `gbgaspress:failed-writes`），可一键重试找回
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座调压站 → 5 台设备 → 11 个点位（均带 v1 标准档案）→ 6 次巡检 → 11 条读数（含标准快照）→ 3 张泄漏处置单（含标准快照）的完整父子孙链条；播种幂等
+- **localStorage 辅助键**：`gbgaspress:db-version`、`gbgaspress:last-backup-at`、`gbgaspress:ui-prefs`、`gbgaspress:reading-drafts`、`gbgaspress:failed-writes`
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 
 ## 六、本地开发

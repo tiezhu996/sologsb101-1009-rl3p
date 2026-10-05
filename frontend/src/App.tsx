@@ -8,6 +8,7 @@ import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
+import RecoveryCenter from './components/common/RecoveryCenter'
 
 export default function App() {
   const location = useLocation()
@@ -88,6 +89,7 @@ export default function App() {
             </Button>
           </Space>
         </div>
+        <RecoveryCenter />
         <Outlet />
       </main>
 

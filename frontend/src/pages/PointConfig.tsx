@@ -7,6 +7,7 @@ import { useMemo, useState } from 'react'
 import {
   Button,
   Checkbox,
+  Drawer,
   Form,
   Input,
   InputNumber,
@@ -17,7 +18,9 @@ import {
   Space,
   Switch,
   Table,
-  Tag
+  Tag,
+  Timeline,
+  Typography
 } from '@arco-design/web-react'
 import type { TableColumnProps } from '@arco-design/web-react'
 import AbnormalTag from '@/components/common/AbnormalTag'
@@ -33,10 +36,11 @@ import {
   POINT_UNITS,
   type Point,
   type PointDraft,
+  type PointStandardVersion,
   type PointTemplate
 } from '@/types/point'
 import { DEVICE_TYPES } from '@/types/device'
-import { abnormalLevelOf, deviationPctOf, rangeText } from '@/utils/range'
+import { abnormalLevelOf, rangeText } from '@/utils/range'
 
 export default function PointConfig() {
   const stationStore = useStationStore()
@@ -48,6 +52,11 @@ export default function PointConfig() {
   const [templateOpen, setTemplateOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [checkedTemplates, setCheckedTemplates] = useState<string[]>(POINT_TEMPLATES.map((item) => item.name))
+  const [historyPoint, setHistoryPoint] = useState<Point | null>(null)
+  const [historyRows, setHistoryRows] = useState<PointStandardVersion[]>([])
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [bulkReasonOpen, setBulkReasonOpen] = useState(false)
+  const [bulkReason, setBulkReason] = useState('')
 
   const filter = stationStore.pointFilter
   const filterSelects = useMemo(
@@ -133,10 +142,10 @@ export default function PointConfig() {
     }
     if (editingId) {
       await stationStore.updatePoint(editingId, payload)
-      Message.success('点位已更新，历史读数偏差率已重算')
+      Message.success('点位已更新；若标准区间变更已生成新版本，历史读数仍按当时标准判定')
     } else {
       await stationStore.createPoint(payload)
-      Message.success('点位已创建')
+      Message.success('点位已创建，标准值已建档为 v1')
     }
     setPointOpen(false)
   }
@@ -147,12 +156,37 @@ export default function PointConfig() {
   }
 
   const commitAll = async (): Promise<void> => {
-    const count = await stationStore.commitAllStandardDrafts()
+    if (Object.keys(stationStore.standardDraft).length === 0) {
+      Message.warning('没有待提交的标准值草稿')
+      return
+    }
+    setBulkReason('')
+    setBulkReasonOpen(true)
+  }
+
+  const confirmCommitAll = async (): Promise<void> => {
+    const count = await stationStore.commitAllStandardDrafts(bulkReason || '后台批量修订标准值')
     if (count === 0) {
       Message.warning('没有待提交的标准值草稿')
       return
     }
-    Message.success(`已提交 ${count} 个点位的标准值，历史读数已重算`)
+    Message.success(`已提交 ${count} 个点位的标准新版本；历史巡检按当时标准冻结，未提交草稿已标待复核`)
+    setBulkReasonOpen(false)
+  }
+
+  const openHistory = async (point: Point): Promise<void> => {
+    const rows = await stationStore.standardHistory(point.id)
+    setHistoryPoint(point)
+    setHistoryRows(rows)
+    setHistoryOpen(true)
+  }
+
+  const commitRow = async (record: Point): Promise<void> => {
+    const result = await stationStore.commitStandardDraft(record.id)
+    void result
+    Message.success(
+      `${record.name} 标准值已生成新版本；已完成巡检仍按原标准标记，待提交草稿已标待复核`
+    )
   }
 
   const openTemplate = (): void => {
@@ -191,14 +225,14 @@ export default function PointConfig() {
     },
     {
       title: '标准区间（可编辑）',
-      width: 330,
+      width: 360,
       render: (_value, record) => {
         const draft = stationStore.standardDraft[record.id]
         const min = draft ? draft.standardMin : record.standardMin
         const max = draft ? draft.standardMax : record.standardMax
         const critical = draft ? draft.isCritical : record.isCritical
         return (
-          <Space size={4}>
+          <Space size={4} wrap>
             <InputNumber
               size="small"
               style={{ width: 92 }}
@@ -206,6 +240,7 @@ export default function PointConfig() {
               step={0.01}
               onChange={(value: number | undefined) =>
                 stationStore.setStandardDraft(record.id, {
+                  ...(draft ?? { reason: '' }),
                   standardMin: Number(value ?? 0),
                   standardMax: max,
                   isCritical: critical
@@ -220,6 +255,7 @@ export default function PointConfig() {
               step={0.01}
               onChange={(value: number | undefined) =>
                 stationStore.setStandardDraft(record.id, {
+                  ...(draft ?? { reason: '' }),
                   standardMin: min,
                   standardMax: Number(value ?? 0),
                   isCritical: critical
@@ -227,16 +263,11 @@ export default function PointConfig() {
               }
             />
             <span className="muted">{record.unit}</span>
-            <Button
-              type="text"
-              size="small"
-              disabled={!draft}
-              onClick={async () => {
-                await stationStore.commitStandardDraft(record.id)
-                Message.success(`${record.name} 标准值已保存，历史读数已重算`)
-              }}
-            >
-              保存
+            <Button type="text" size="small" disabled={!draft} onClick={() => void commitRow(record)}>
+              发新版本
+            </Button>
+            <Button type="text" size="small" onClick={() => void openHistory(record)}>
+              版本
             </Button>
           </Space>
         )
@@ -254,6 +285,7 @@ export default function PointConfig() {
             checked={critical}
             onChange={(checked: boolean) =>
               stationStore.setStandardDraft(record.id, {
+                ...(draft ?? { reason: '' }),
                 standardMin: draft ? draft.standardMin : record.standardMin,
                 standardMax: draft ? draft.standardMax : record.standardMax,
                 isCritical: checked
@@ -264,9 +296,14 @@ export default function PointConfig() {
       }
     },
     {
-      title: '标准区间',
-      width: 160,
-      render: (_value, record) => rangeText(record.standardMin, record.standardMax, record.unit)
+      title: '现行版本 / 区间',
+      width: 190,
+      render: (_value, record) => (
+        <Space size={4}>
+          <Tag color="arcoblue" size="small">v{record.standardVersion ?? 1}</Tag>
+          <span>{rangeText(record.standardMin, record.standardMax, record.unit)}</span>
+        </Space>
+      )
     },
     {
       title: '异常读数',
@@ -352,7 +389,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             点位清单（{rows.length} / {stats.total}）
           </h3>
-          <span className="muted">标准值改动先进入草稿，保存后自动重算历史读数偏差率</span>
+          <span className="muted">标准值改动先进草稿，「发新版本」后只影响尚未提交的巡检；历史读数与处置单按当时标准冻结</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
@@ -438,9 +475,80 @@ export default function PointConfig() {
           ))}
         </Checkbox.Group>
         <div className="muted" style={{ marginTop: 10 }}>
-          当前读数平均偏差参考：{deviationPctOf(0.3, 0.18, 0.25).toFixed(2)}%（示例计算）
+          标准区间用于实时偏差判定；历史读数会永久保留提交时的标准版本。
         </div>
       </Modal>
+
+      <Modal
+        visible={bulkReasonOpen}
+        title="提交标准值新版本"
+        onCancel={() => setBulkReasonOpen(false)}
+        onOk={confirmCommitAll}
+        okText="确认发版"
+        cancelText="取消"
+        unmountOnExit
+      >
+        <Form layout="vertical">
+          <Form.Item label="本次变更原因（写入版本档案，便于追溯）">
+            <Input.TextArea
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              placeholder="如 调压器年检后收紧出口压力上限"
+              value={bulkReason}
+              onChange={(value: string) => setBulkReason(value)}
+            />
+          </Form.Item>
+        </Form>
+        <div className="muted">
+          共 {Object.keys(stationStore.standardDraft).length} 个点位将生成新版本；已完成巡检的历史异常判定不变，未提交的巡检草稿将标「待复核」。
+        </div>
+      </Modal>
+
+      <Drawer
+        width={480}
+        title={historyPoint ? `标准值版本档案 · ${historyPoint.name}` : '标准值版本档案'}
+        visible={historyOpen}
+        onCancel={() => setHistoryOpen(false)}
+        footer={null}
+      >
+        {historyRows.length === 0 ? (
+          <EmptyPanel title="暂无版本记录" description="该点位尚未生成标准版本。" compact />
+        ) : (
+          <Timeline>
+            {historyRows.map((standard, index) => (
+              <Timeline.Item
+                key={standard.id}
+                dotColor={index === 0 ? '#165dff' : '#86909c'}
+                label={new Date(standard.effectiveAt).toLocaleString('zh-CN', { hour12: false })}
+              >
+                <Space direction="vertical" size={4}>
+                  <Space size={6}>
+                    <Tag color={index === 0 ? 'arcoblue' : 'gray'} size="small">
+                      v{standard.version}
+                    </Tag>
+                    {index === 0 ? <Tag color="green" size="small">现行</Tag> : null}
+                    <span>
+                      {rangeText(standard.standardMin, standard.standardMax, standard.unit)}
+                      {standard.isCritical ? ' · 关键点' : ''}
+                    </span>
+                  </Space>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {standard.reason || '—'}
+                  </Typography.Text>
+                  {standard.basedOnVersion > 0 ? (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      基于 v{standard.basedOnVersion} 修订
+                    </Typography.Text>
+                  ) : (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      基线版本
+                    </Typography.Text>
+                  )}
+                </Space>
+              </Timeline.Item>
+            ))}
+          </Timeline>
+        )}
+      </Drawer>
     </div>
   )
 }

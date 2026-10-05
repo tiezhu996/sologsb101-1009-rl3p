@@ -1,10 +1,14 @@
 /**
  * /patrols 巡检录入
  * 按计划日期逐点录入压力/温度/泄漏浓度，录入即与标准区间比对并给出异常级别。
+ * - 标准升级后未提交草稿标「待复核」，保留原值与新旧差异
+ * - 读数/完成巡检走行版本乐观锁，冲突完整留待合并，写入失败可从本地草稿找回
+ * - 已保存读数按冻结的当时标准展示，后来的标准不改判
  * 消费 Patrol、Reading、Point；复用 <AbnormalTag>、<FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Alert,
   Button,
   Form,
   Input,
@@ -22,15 +26,28 @@ import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useStationStore } from '@/stores/stationStore'
-import { usePatrolStore } from '@/stores/patrolStore'
+import { usePatrolStore, type SaveOutcome } from '@/stores/patrolStore'
+import { useMergeStore } from '@/stores/mergeStore'
 import { usePatrolGap } from '@/hooks/usePatrolGap'
 import { PATROL_STATES, type Patrol, type PatrolState } from '@/types/patrol'
 import type { Point } from '@/types/point'
 import type { Reading } from '@/types/reading'
+import { abnormalLevelOf, formatValue, rangeText } from '@/utils/range'
+
+function describeOutcome(outcome: SaveOutcome, action: string): void {
+  if (outcome.status === 'saved') {
+    Message.success(outcome.count > 0 ? `已保存 ${outcome.count} 条读数，异常判定按提交时标准冻结` : `${action}成功`)
+  } else if (outcome.status === 'conflict') {
+    Message.warning('另一个标签页已先提交本巡检，本份已完整保留到「待处理中心」，可继续合并')
+  } else {
+    Message.error('写入失败，内容已存入本地草稿，可在顶部「待处理中心」重试找回')
+  }
+}
 
 export default function PatrolEntry() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
+  const mergeStore = useMergeStore()
 
   const [completeForm] = Form.useForm<{ patrolDate: string; patrolman: string; envNote: string }>()
   const [noteForm] = Form.useForm<{ note: string }>()
@@ -85,19 +102,22 @@ export default function PatrolEntry() {
   }, [activePatrol?.id, activePoints.length])
 
   const abnormalInDraft = activePoints.filter((point) => {
-    const value = activePatrol ? patrolStore.readingDraft[`${activePatrol.id}:${point.id}`] : undefined
-    if (value === undefined) return false
-    return patrolStore.judge(point, value).isAbnormal
+    const entry = patrolStore.draftEntry(activePatrol?.id ?? '', point.id)
+    if (!entry || entry.needsReview) return false
+    return patrolStore.judge(point, entry.value).isAbnormal
   }).length
+
+  const reviewCount = activePatrol ? patrolStore.reviewCountOf(activePatrol.id) : 0
+  const targetPendingMerges = activePatrol ? mergeStore.listOfTarget(activePatrol.id) : []
 
   const saveAll = async (): Promise<void> => {
     if (!activePatrol) return
-    const count = await patrolStore.saveReadingDrafts(activePatrol.id, activePoints)
-    if (count === 0) {
-      Message.warning('没有可保存的读数，请先录入')
+    if (patrolStore.reviewCountOf(activePatrol.id) > 0) {
+      Message.warning('存在标准更新后的待复核草稿，请先逐条「复核保留」或「按新值修改」')
       return
     }
-    Message.success(`已保存 ${count} 条读数，异常判定已同步更新`)
+    const outcome = await patrolStore.saveReadingDrafts(activePatrol.id, activePoints)
+    describeOutcome(outcome, '保存')
   }
 
   const openComplete = (): void => {
@@ -112,12 +132,22 @@ export default function PatrolEntry() {
 
   const submitComplete = async (): Promise<void> => {
     if (!activePatrol) return
+    if (patrolStore.reviewCountOf(activePatrol.id) > 0) {
+      Message.warning('存在待复核草稿，请先完成复核再提交巡检')
+      setCompleteOpen(false)
+      return
+    }
     const values = await completeForm.validate().catch(() => null)
     if (!values) return
-    await patrolStore.saveReadingDrafts(activePatrol.id, activePoints)
-    await patrolStore.completePatrol(activePatrol.id, values.patrolDate, values.patrolman, values.envNote)
-    Message.success('巡检已完成，异常读数可在异常分级页派发处置单')
-    setCompleteOpen(false)
+    const outcome = await patrolStore.completePatrolWithReadings(
+      activePatrol.id,
+      values.patrolDate,
+      values.patrolman,
+      values.envNote,
+      activePoints
+    )
+    describeOutcome(outcome, '完成')
+    if (outcome.status === 'saved') setCompleteOpen(false)
   }
 
   const markMissed = async (patrol: Patrol): Promise<void> => {
@@ -140,8 +170,23 @@ export default function PatrolEntry() {
       noteTarget.value,
       values.note
     )
-    Message.success('现场备注已保存')
+    Message.success('现场备注已保存（异常判定仍按该读数冻结的标准）')
     setNoteOpen(false)
+  }
+
+  /** 已保存读数的判定区间：优先用冻结快照，保证历史不改判 */
+  const frozenPointView = (reading: Reading): Point | null => {
+    const current = stationStore.points.find((item) => item.id === reading.pointId) ?? null
+    const snapshot = reading.standardSnapshot
+    if (!snapshot || !current) return current
+    return {
+      ...current,
+      standardMin: snapshot.standardMin,
+      standardMax: snapshot.standardMax,
+      unit: snapshot.unit,
+      isCritical: snapshot.isCritical,
+      standardVersion: snapshot.version
+    }
   }
 
   const readingColumns: TableColumnProps<Reading>[] = [
@@ -151,23 +196,31 @@ export default function PatrolEntry() {
       render: (_value, record) => stationStore.points.find((point) => point.id === record.pointId)?.name ?? '点位已删除'
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '判定标准（当时冻结）',
+      width: 210,
       render: (_value, record) => {
-        const point = stationStore.points.find((item) => item.id === record.pointId)
-        return point ? `${point.standardMin} ~ ${point.standardMax} ${point.unit}` : '—'
+        const frozen = frozenPointView(record)
+        if (!frozen) return '—'
+        return (
+          <Space size={4}>
+            <Tag size="small" color="gray">v{record.standardSnapshot?.version ?? '—'}</Tag>
+            <span>{rangeText(frozen.standardMin, frozen.standardMax, frozen.unit)}</span>
+          </Space>
+        )
       }
     },
-    { title: '读数', dataIndex: 'value', width: 120, render: (value: number) => value },
+    { title: '读数', dataIndex: 'value', width: 120, render: (value: number, record) => formatValue(value, record.standardSnapshot?.unit ?? '') },
     { title: '偏差率', dataIndex: 'deviationPct', width: 110, render: (value: number) => `${value.toFixed(2)}%` },
     {
       title: '判定',
       width: 160,
-      render: (_value, record) => {
-        const point = stationStore.points.find((item) => item.id === record.pointId)
-        if (!point) return <Tag>—</Tag>
-        return <AbnormalTag level={patrolStore.judge(point, record.value).level} size="small" />
-      }
+      render: (_value, record) => (
+        <AbnormalTag
+          level={abnormalLevelOf(record.deviationPct, record.standardSnapshot?.isCritical ?? false)}
+          deviationPct={record.deviationPct}
+          size="small"
+        />
+      )
     },
     { title: '备注', dataIndex: 'note', width: 200, render: (value: string) => value || '—' },
     {
@@ -194,7 +247,7 @@ export default function PatrolEntry() {
         <div>
           <h2 className="page-head__title">巡检录入</h2>
           <p className="page-head__desc">
-            选定巡检任务后逐点录入读数，系统即时给出偏差率与异常级别；完成后可标记漏检或删除任务。
+            选定巡检任务后逐点录入读数，系统即时给出偏差率与异常级别；标准更新后的草稿先标待复核，完成后判定永久冻结。
           </p>
         </div>
         <div className="page-head__actions">
@@ -230,6 +283,7 @@ export default function PatrolEntry() {
             patrols.map((patrol) => {
               const item = gap.gapOf(patrol)
               const station = stationStore.stations.find((entry) => entry.id === patrol.stationId)
+              const pendingCount = mergeStore.listOfTarget(patrol.id).length
               return (
                 <div
                   key={patrol.id}
@@ -238,11 +292,12 @@ export default function PatrolEntry() {
                 >
                   <div className="card-list-item__head">
                     <span>{station ? station.name : '未知站点'}</span>
-                    <Tag
-                      color={patrol.state === '已完成' ? 'green' : patrol.state === '漏检' ? 'red' : 'blue'}
-                    >
-                      {patrol.state}
-                    </Tag>
+                    <Space size={4}>
+                      {pendingCount > 0 ? <Tag color="orange" size="small">待合并 {pendingCount}</Tag> : null}
+                      <Tag color={patrol.state === '已完成' ? 'green' : patrol.state === '漏检' ? 'red' : 'blue'}>
+                        {patrol.state}
+                      </Tag>
+                    </Space>
                   </div>
                   <div className="card-list-item__meta">
                     <span>计划 {patrol.planDate}</span>
@@ -300,9 +355,25 @@ export default function PatrolEntry() {
                   <span className="muted"> （{activePatrol.planDate}，{activePoints.length} 个点位）</span>
                 </h3>
                 <span className="muted">
-                  草稿中异常 {abnormalInDraft} 项 / 已保存异常 {activeReadings.filter((item) => item.isAbnormal).length} 项
+                  草稿异常 {abnormalInDraft} 项 · 待复核 {reviewCount} 项 · 已存档异常 {activeReadings.filter((item) => item.isAbnormal).length} 项
                 </span>
               </div>
+
+              {targetPendingMerges.length > 0 ? (
+                <Alert
+                  type="warning"
+                  style={{ margin: '8px 0' }}
+                  content={`本巡检有 ${targetPendingMerges.length} 份其他标签页的并发提交待合并，请在顶部「待处理中心」处理。`}
+                />
+              ) : null}
+
+              {activePatrol.state === '已完成' ? (
+                <Alert
+                  type="info"
+                  style={{ margin: '8px 0' }}
+                  content="该巡检已完成：所有读数按完成时的标准版本冻结判定，之后修改点位标准不会改判历史异常或已派发的泄漏处置单。"
+                />
+              ) : null}
 
               {activePoints.length === 0 ? (
                 <EmptyPanel
@@ -314,55 +385,115 @@ export default function PatrolEntry() {
                 <div
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
                     gap: 12,
                     marginBottom: 16
                   }}
                 >
                   {activePoints.map((point) => {
-                    const key = `${activePatrol.id}:${point.id}`
-                    const value = patrolStore.readingDraft[key]
-                    const judgement = value === undefined ? null : patrolStore.judge(point, value)
+                    const entry = patrolStore.draftEntry(activePatrol.id, point.id)
+                    const value = entry?.value
+                    const currentJudgement = value === undefined ? null : patrolStore.judge(point, value)
                     const saved = activeReadings.find((item) => item.pointId === point.id)
                     return (
-                      <div key={point.id} className="panel" style={{ padding: 12 }}>
+                      <div
+                        key={point.id}
+                        className="panel"
+                        style={{
+                          padding: 12,
+                          border: entry?.needsReview ? '1px solid #ff7d00' : undefined,
+                          background: entry?.needsReview ? '#fff7e8' : undefined
+                        }}
+                      >
                         <div className="card-list-item__head">
                           <span>
                             {point.name}
                             {point.isCritical ? <Tag color="orange" size="small" style={{ marginLeft: 6 }}>关键点</Tag> : null}
+                            <Tag size="small" style={{ marginLeft: 6 }}>标准 v{point.standardVersion}</Tag>
                           </span>
-                          {judgement ? <AbnormalTag level={judgement.level} deviationPct={judgement.deviationPct} size="small" /> : null}
+                          {entry?.needsReview ? (
+                            <Tag color="orange" size="small">待复核</Tag>
+                          ) : currentJudgement ? (
+                            <AbnormalTag level={currentJudgement.level} deviationPct={currentJudgement.deviationPct} size="small" />
+                          ) : null}
                         </div>
                         <div className="card-list-item__meta">
                           <span>
-                            标准 {point.standardMin} ~ {point.standardMax} {point.unit}
+                            现行 {rangeText(point.standardMin, point.standardMax, point.unit)}
                           </span>
                           {saved ? <span>· 已存档 {saved.value}</span> : null}
                         </div>
-                        <Space style={{ marginTop: 8 }}>
-                          <InputNumber
-                            size="small"
-                            style={{ width: 140 }}
-                            value={value}
-                            step={point.unit === 'ppm' ? 1 : 0.01}
-                            placeholder="输入读数"
-                            onChange={(next: number | undefined) => {
-                              if (next === undefined) return
-                              patrolStore.setReadingDraft(activePatrol.id, point.id, Number(next))
-                            }}
-                          />
-                          <Button
-                            size="small"
-                            disabled={value === undefined}
-                            onClick={async () => {
-                              if (value === undefined) return
-                              await patrolStore.saveSingleReading(activePatrol.id, point, value, saved ? saved.note : '')
-                              Message.success(`${point.name} 读数已保存`)
-                            }}
-                          >
-                            保存
-                          </Button>
-                        </Space>
+
+                        {entry?.needsReview ? (
+                          <div style={{ marginTop: 8 }}>
+                            <Alert
+                              type="warning"
+                              style={{ fontSize: 12 }}
+                              content={
+                                <div>
+                                  <div>
+                                    录入原值 <strong>{formatValue(entry.value, point.unit)}</strong> 依据 v{entry.basisVersion}
+                                    ，现行标准 v{entry.latestVersion}
+                                  </div>
+                                  <div>
+                                    原偏差 {entry.oldDeviationPct?.toFixed(2) ?? '—'}% ·
+                                    原判定 {entry.oldIsAbnormal ? '异常' : '正常'} ·
+                                    新偏差 {currentJudgement ? `${currentJudgement.deviationPct.toFixed(2)}%` : '—'} ·
+                                    新判定 {currentJudgement?.level ?? '—'}
+                                  </div>
+                                </div>
+                              }
+                            />
+                            <Space size={6} style={{ marginTop: 8 }} wrap>
+                              <InputNumber
+                                size="small"
+                                style={{ width: 130 }}
+                                value={value}
+                                step={point.unit === 'ppm' ? 1 : 0.01}
+                                onChange={(next: number | undefined) => {
+                                  if (next === undefined) return
+                                  // 修改数值即视为按新标准重录（清除待复核）
+                                  patrolStore.reviseDraft(activePatrol.id, point, Number(next))
+                                }}
+                              />
+                              <Button
+                                size="small"
+                                type="primary"
+                                onClick={() => {
+                                  patrolStore.acknowledgeDraft(activePatrol.id, point)
+                                  Message.success(`已复核：保留原值 ${formatValue(entry.value, point.unit)}，按新标准 v${point.standardVersion} 判定`)
+                                }}
+                              >
+                                复核保留原值
+                              </Button>
+                            </Space>
+                          </div>
+                        ) : (
+                          <Space style={{ marginTop: 8 }}>
+                            <InputNumber
+                              size="small"
+                              style={{ width: 140 }}
+                              value={value}
+                              step={point.unit === 'ppm' ? 1 : 0.01}
+                              placeholder="输入读数"
+                              onChange={(next: number | undefined) => {
+                                if (next === undefined) return
+                                patrolStore.setReadingDraft(activePatrol.id, point, Number(next))
+                              }}
+                            />
+                            <Button
+                              size="small"
+                              disabled={value === undefined}
+                              onClick={async () => {
+                                if (value === undefined) return
+                                await patrolStore.saveSingleReading(activePatrol.id, point, value, entry?.note ?? saved?.note ?? '')
+                                Message.success(`${point.name} 读数已保存（按标准 v${point.standardVersion} 冻结）`)
+                              }}
+                            >
+                              保存
+                            </Button>
+                          </Space>
+                        )}
                       </div>
                     )
                   })}
@@ -371,7 +502,7 @@ export default function PatrolEntry() {
 
               <h4 className="panel-title">已保存读数</h4>
               {activeReadings.length === 0 ? (
-                <EmptyPanel title="暂无已保存读数" description="录入后点击「保存全部读数」或逐点保存。" compact />
+                <EmptyPanel title="暂无已保存读数" description="录入后点击「保存全部读数」或逐点保存；草稿已存本地，重开页面可继续。" compact />
               ) : (
                 <Table<Reading>
                   rowKey="id"
@@ -380,7 +511,7 @@ export default function PatrolEntry() {
                   data={activeReadings}
                   columns={readingColumns}
                   pagination={false}
-                  scroll={{ x: 1100 }}
+                  scroll={{ x: 1200 }}
                 />
               )}
             </>
@@ -410,6 +541,9 @@ export default function PatrolEntry() {
             <Input.TextArea placeholder="如 晴，气温 26℃，无异常气味" autoSize={{ minRows: 2, maxRows: 4 }} />
           </Form.Item>
         </Form>
+        <div className="muted">
+          完成后全部读数按当前标准版本冻结；若其他标签页已先提交，本份将完整保留到待处理中心而不是覆盖。
+        </div>
       </Modal>
 
       <Modal
