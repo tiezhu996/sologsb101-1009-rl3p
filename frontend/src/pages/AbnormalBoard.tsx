@@ -90,9 +90,18 @@ export default function AbnormalBoard() {
         foundTime,
         measure: `${point.name} 实测 ${row.reading.value} ${point.unit}，偏差率 ${row.reading.deviationPct.toFixed(2)}%，${
           station ? station.name : ''
-        } 已派发处置单`
+        } 已派发处置单`,
+        point: {
+          standardMin: row.reading.standardMin,
+          standardMax: row.reading.standardMax,
+          unit: row.reading.standardUnit,
+          isCritical: row.reading.isCritical,
+          currentVersionId: row.reading.standardVersionId,
+          currentVersionNo: row.reading.standardVersionNo
+        },
+        sourceReadingId: row.reading.id
       })
-      Message.success('已派发泄漏处置单')
+      Message.success('已派发泄漏处置单（按该读数当时标准留痕）')
       return
     }
     await patrolStore.saveSingleReading(row.reading.patrolId, point, row.reading.value, '异常已确认并记录')
@@ -115,7 +124,16 @@ export default function AbnormalBoard() {
           stationId: row.point.stationId,
           concentrationPpm: row.reading.value,
           foundTime: row.patrol ? row.patrol.patrolDate || row.patrol.planDate : new Date().toISOString().slice(0, 10),
-          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`
+          measure: `${row.point.name} 实测 ${row.reading.value} ppm，批量派单`,
+          point: {
+            standardMin: row.reading.standardMin,
+            standardMax: row.reading.standardMax,
+            unit: row.reading.standardUnit,
+            isCritical: row.reading.isCritical,
+            currentVersionId: row.reading.standardVersionId,
+            currentVersionNo: row.reading.standardVersionNo
+          },
+          sourceReadingId: row.reading.id
         })
         leakCount += 1
       } else {
@@ -143,7 +161,7 @@ export default function AbnormalBoard() {
       Number(values.value),
       values.note
     )
-    Message.success('读数已修正，偏差率与异常级别已重算')
+    Message.success('读数已按当前点位标准重新判定并保存')
     setFixOpen(false)
   }
 
@@ -174,10 +192,12 @@ export default function AbnormalBoard() {
       )
     },
     {
-      title: '标准区间',
-      width: 180,
+      title: '当时标准（冻结）',
+      width: 200,
       render: (_value, record) =>
-        record.point ? `${record.point.standardMin} ~ ${record.point.standardMax} ${record.point.unit}` : '—'
+        record.reading.standardVersionId
+          ? `${record.reading.standardMin} ~ ${record.reading.standardMax} ${record.reading.standardUnit}（v${record.reading.standardVersionNo || '—'}）`
+          : '—'
     },
     {
       title: '读数',

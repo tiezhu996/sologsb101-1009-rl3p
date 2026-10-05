@@ -33,6 +33,7 @@ import {
   readLastBackupAt,
   readStampedDbVersion,
   resetDatabase,
+  type PatrolRow,
   type ReadingRow
 } from '@/utils/db'
 import { PATROL_STATES, type Patrol, type PatrolGap, type PatrolState } from '@/types/patrol'
@@ -103,14 +104,29 @@ export default function PlanList() {
     Message.warning('已标记为漏检')
   }
 
-  const complete = async (patrol: Patrol): Promise<void> => {
-    await patrolStore.completePatrol(
+  const complete = async (patrol: PatrolRow): Promise<void> => {
+    const points = (() => {
+      const deviceIds = stationStore.devices
+        .filter((device) => device.stationId === patrol.stationId)
+        .map((device) => device.id)
+      return stationStore.points.filter((point) => deviceIds.includes(point.deviceId))
+    })()
+    const revision = patrol.revision ?? 0
+    const result = await patrolStore.completePatrol(
       patrol.id,
-      new Date().toISOString().slice(0, 10),
-      patrol.patrolman || '未署名',
-      patrol.envNote || '补检完成'
+      {
+        patrolDate: new Date().toISOString().slice(0, 10),
+        patrolman: patrol.patrolman || '未署名',
+        envNote: patrol.envNote || '补检完成'
+      },
+      revision,
+      points
     )
-    Message.success('已补检完成')
+    if (result.outcome === 'committed') {
+      Message.success('已补检完成，读数按各自当时标准冻结')
+    } else {
+      Message.error('另一个标签页已先提交该巡检，请在巡检录入页的待合并面板处理')
+    }
   }
 
   const remove = async (patrol: Patrol): Promise<void> => {
@@ -162,7 +178,7 @@ export default function PlanList() {
     Message.success('已重置为演示数据')
   }
 
-  const columns: TableColumnProps<Patrol>[] = [
+  const columns: TableColumnProps<PatrolRow>[] = [
     {
       title: '调压站',
       width: 200,

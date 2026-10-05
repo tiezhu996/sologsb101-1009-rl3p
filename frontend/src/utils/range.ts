@@ -1,6 +1,8 @@
 /**
  * 标准区间判定、偏差率计算、ppm 与压力单位换算
  */
+import type { StandardSnapshot } from '@/types/standard'
+
 export type AbnormalLevel = '正常' | '轻微超标' | '严重超标'
 
 /** 非关键点偏差率超过 10% 判严重超标 */
@@ -93,6 +95,21 @@ export function judgeReading(value: number, min: number, max: number, isCritical
     isAbnormal: level !== '正常',
     level,
     weight: abnormalWeight(level, isCritical)
+  }
+}
+
+/** 按「当时标准快照」判定：历史读数永远用自己留存的快照，不随现行标准改判 */
+export function judgeByStandard(value: number, standard: StandardSnapshot): ReadingJudgement {
+  return judgeReading(value, standard.standardMin, standard.standardMax, standard.isCritical)
+}
+
+/** 从带标准快照的读数 / 处置单行取标准快照 */
+export function snapshotOf(ref: StandardSnapshot): StandardSnapshot {
+  return {
+    standardMin: ref.standardMin,
+    standardMax: ref.standardMax,
+    standardUnit: ref.standardUnit,
+    isCritical: ref.isCritical
   }
 }
 

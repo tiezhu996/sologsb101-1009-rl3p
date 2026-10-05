@@ -7,6 +7,7 @@ import { ROUTES } from './router'
 import { useStationStore } from './stores/stationStore'
 import { usePatrolStore } from './stores/patrolStore'
 import { useLeakStore } from './stores/leakStore'
+import { useMergeStore } from './stores/mergeStore'
 import { usePatrolGap } from './hooks/usePatrolGap'
 
 export default function App() {
@@ -15,16 +16,30 @@ export default function App() {
   const stationStore = useStationStore()
   const patrolStore = usePatrolStore()
   const leakStore = useLeakStore()
+  const mergeStore = useMergeStore()
   const gap = usePatrolGap(patrolStore.patrols)
 
   const currentStation = stationStore.currentStation()
+  const pendingPatrolMerges = mergeStore.pendingCount('patrol')
+  const pendingLeakMerges = mergeStore.pendingCount('leak')
+  const recoveryCount = mergeStore.localDrafts.length
 
   const navItems = [
     { path: ROUTES.stations, label: '调压站台账', count: stationStore.stations.length },
     { path: ROUTES.points, label: '点位配置', count: stationStore.points.length },
-    { path: ROUTES.patrols, label: '巡检录入', count: patrolStore.patrols.length },
+    {
+      path: ROUTES.patrols,
+      label: '巡检录入',
+      count: patrolStore.patrols.length,
+      alert: pendingPatrolMerges
+    },
     { path: ROUTES.abnormal, label: '异常分级', count: patrolStore.abnormalRows().length },
-    { path: ROUTES.leaks, label: '泄漏处置', count: leakStore.counts()['待处置'] },
+    {
+      path: ROUTES.leaks,
+      label: '泄漏处置',
+      count: leakStore.counts()['待处置'],
+      alert: pendingLeakMerges
+    },
     { path: ROUTES.plans, label: '巡检计划', count: gap.overdueCount }
   ]
 
@@ -50,6 +65,11 @@ export default function App() {
             >
               <span>{item.label}</span>
               {item.count > 0 ? <em className="app-nav__badge">{item.count}</em> : null}
+              {'alert' in item && item.alert ? (
+                <em className="app-nav__badge" style={{ background: '#f53f3f' }} title="有待合并的并发提交">
+                  {item.alert}
+                </em>
+              ) : null}
             </button>
           ))}
         </nav>
@@ -79,6 +99,16 @@ export default function App() {
             )}
           </Space>
           <Space size={8} wrap>
+            {recoveryCount > 0 ? (
+              <Tag color="orange" onClick={() => navigate(ROUTES.patrols)} style={{ cursor: 'pointer' }}>
+                {recoveryCount} 份写入失败内容可找回
+              </Tag>
+            ) : null}
+            {(pendingPatrolMerges > 0 || pendingLeakMerges > 0) ? (
+              <Tag color="red">
+                待合并：巡检 {pendingPatrolMerges} · 处置单 {pendingLeakMerges}
+              </Tag>
+            ) : null}
             <Badge count={leakStore.counts()['待处置']} dotStyle={{ background: '#f53f3f' }} />
             <Button size="small" onClick={() => navigate(ROUTES.stations)}>
               调压站台账

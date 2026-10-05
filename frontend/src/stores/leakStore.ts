@@ -1,10 +1,17 @@
 /**
  * 泄漏处置状态（Zustand）
  * 维护处置单状态机、复检值与闭环统计。
+ *
+ * 追溯口径：处置单创建时冻结当时浓度点位标准（版本号 / 上下限 / 关键点），
+ * 后续标准更新不改判历史处置单；复检合格阈值仍按固定 50 ppm 口径。
+ *
+ * 并发口径：advance / submitRetest / 编辑提交走 revision 乐观锁，
+ * 两个标签页并发时先写入者生效，败方完整载荷由页面层留作待合并。
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, type LeakRow } from '@/utils/db'
+import { createId, db, nextRevision, standardOfPoint, type LeakRow } from '@/utils/db'
+import { RevisionConflict } from '@/utils/conflict'
 import {
   LEAK_RETEST_PASS_PPM,
   retestPassed,
@@ -13,8 +20,12 @@ import {
   type LeakState
 } from '@/types/leak'
 
+export type LeakCommitResult =
+  | { outcome: 'committed'; leak: LeakRow }
+  | { outcome: 'conflict'; expectedRevision: number; currentRevision: number }
+
 interface LeakState_ {
-  leaks: Leak[]
+  leaks: LeakRow[]
   stateFilter: LeakState[]
   stationId: string
   onlyOpen: boolean
@@ -22,10 +33,22 @@ interface LeakState_ {
   patchFilter: (patch: { stateFilter?: LeakState[]; stationId?: string; onlyOpen?: boolean }) => void
   resetFilter: () => void
   createLeak: (draft: LeakDraft) => Promise<Leak>
-  updateLeak: (id: string, patch: Partial<LeakDraft>) => Promise<void>
+  /** 编辑提交（乐观锁） */
+  updateLeak: (id: string, patch: Partial<LeakDraft>, expectedRevision: number) => Promise<LeakCommitResult>
   removeLeak: (id: string) => Promise<void>
-  advance: (id: string, params?: { handler?: string; measure?: string }) => Promise<LeakState | null>
-  submitRetest: (id: string, retestValuePpm: number, handler: string) => Promise<boolean>
+  /** 状态推进（乐观锁） */
+  advance: (
+    id: string,
+    expectedRevision: number,
+    params?: { handler?: string; measure?: string }
+  ) => Promise<LeakCommitResult | { outcome: 'noop' }>
+  /** 录入复检（乐观锁） */
+  submitRetest: (
+    id: string,
+    expectedRevision: number,
+    retestValuePpm: number,
+    handler: string
+  ) => Promise<(LeakCommitResult & { passed?: boolean }) | { outcome: 'noop' }>
   hasLeakOfDevice: (deviceId: string) => boolean
   createFromAbnormal: (payload: {
     deviceId: string
@@ -33,11 +56,19 @@ interface LeakState_ {
     concentrationPpm: number
     foundTime: string
     measure: string
+    /** 来源浓度点位（冻结当时标准） */
+    point?: { standardMin: number; standardMax: number; unit: string; isCritical: boolean; currentVersionId: string; currentVersionNo: number }
+    sourceReadingId?: string
   }) => Promise<Leak>
   counts: () => Record<LeakState, number>
   closedPercent: () => number
   retestPassCount: () => number
-  filteredLeaks: () => Leak[]
+  filteredLeaks: () => LeakRow[]
+}
+
+/** 手工新建处置单的默认浓度标准（找不到 ppm 点位时） */
+function fallbackPpmStandard() {
+  return { standardMin: 0, standardMax: LEAK_RETEST_PASS_PPM, standardUnit: 'ppm', isCritical: true, standardVersionId: '', standardVersionNo: 0 }
 }
 
 export const useLeakStore = create<LeakState_>((set, get) => ({
@@ -61,6 +92,15 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
 
   async createLeak(draft) {
     const device = await db.devices.get(draft.deviceId)
+    // 手工新建：尝试取该设备上的浓度点位冻结当时标准，找不到则用默认 0~50 ppm
+    const ppmPoint = await db.points.where('deviceId').equals(draft.deviceId).first()
+    const standard = ppmPoint
+      ? {
+          ...standardOfPoint(ppmPoint),
+          standardVersionId: ppmPoint.currentVersionId,
+          standardVersionNo: ppmPoint.currentVersionNo
+        }
+      : fallbackPpmStandard()
     const now = Date.now()
     const row: LeakRow = {
       id: createId('lk'),
@@ -72,6 +112,8 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
       state: draft.state,
       retestValuePpm: Number(draft.retestValuePpm) || 0,
       handler: draft.handler.trim(),
+      sourceReadingId: '',
+      ...standard,
       createdAt: now,
       updatedAt: now
     }
@@ -79,38 +121,70 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
     return row
   },
 
-  async updateLeak(id, patch) {
-    const next: Partial<LeakRow> = { ...patch, updatedAt: Date.now() }
-    if (patch.measure !== undefined) next.measure = patch.measure.trim()
-    if (patch.handler !== undefined) next.handler = patch.handler.trim()
-    await db.leaks.update(id, next)
+  async updateLeak(id, patch, expectedRevision) {
+    try {
+      const result = await db.transaction('rw', db.leaks, async () => {
+        const current = await db.leaks.get(id)
+        if (!current) throw new Error('处置单不存在')
+        const currentRev = typeof current.revision === 'number' ? current.revision : 0
+        if (currentRev !== expectedRevision) throw new RevisionConflict(expectedRevision, currentRev)
+        const next: LeakRow = {
+          ...current,
+          ...patch,
+          measure: patch.measure !== undefined ? patch.measure.trim() : current.measure,
+          handler: patch.handler !== undefined ? patch.handler.trim() : current.handler,
+          // 历史快照不随编辑改判：未提供的标准字段一律沿用原值
+          standardMin: current.standardMin,
+          standardMax: current.standardMax,
+          standardUnit: current.standardUnit,
+          isCritical: current.isCritical,
+          standardVersionId: current.standardVersionId,
+          standardVersionNo: current.standardVersionNo,
+          sourceReadingId: current.sourceReadingId,
+          updatedAt: Date.now(),
+          revision: nextRevision(currentRev)
+        }
+        await db.leaks.put(next)
+        return next
+      })
+      return { outcome: 'committed', leak: result }
+    } catch (error) {
+      if (error instanceof RevisionConflict) {
+        return { outcome: 'conflict', expectedRevision, currentRevision: error.currentRevision }
+      }
+      throw error
+    }
   },
 
   async removeLeak(id) {
     await db.leaks.delete(id)
   },
 
-  async advance(id, params) {
+  async advance(id, expectedRevision, params) {
     const leak = get().leaks.find((item) => item.id === id)
-    if (!leak) return null
-    const next: LeakState | null = leak.state === '待处置' ? '已处置' : leak.state === '已处置' ? '已复检' : null
-    if (!next) return null
-    const patch: Partial<LeakRow> = { state: next, updatedAt: Date.now() }
-    if (params?.handler !== undefined) patch.handler = params.handler.trim()
-    if (params?.measure !== undefined) patch.measure = params.measure.trim()
-    await db.leaks.update(id, patch)
-    return next
+    if (!leak) return { outcome: 'noop' as const }
+    const nextState: LeakState | null = leak.state === '待处置' ? '已处置' : leak.state === '已处置' ? '已复检' : null
+    if (!nextState) return { outcome: 'noop' as const }
+    return get().updateLeak(
+      id,
+      {
+        state: nextState,
+        ...(params?.handler !== undefined ? { handler: params.handler } : {}),
+        ...(params?.measure !== undefined ? { measure: params.measure } : {})
+      },
+      expectedRevision
+    )
   },
 
-  async submitRetest(id, retestValuePpm, handler) {
+  async submitRetest(id, expectedRevision, retestValuePpm, handler) {
     const value = Number(retestValuePpm) || 0
-    await db.leaks.update(id, {
-      state: '已复检',
-      retestValuePpm: value,
-      handler: handler.trim() || '未署名',
-      updatedAt: Date.now()
-    })
-    return retestPassed(value)
+    const result = await get().updateLeak(
+      id,
+      { state: '已复检', retestValuePpm: value, handler: handler.trim() || '未署名' },
+      expectedRevision
+    )
+    if (result.outcome === 'committed') return { ...result, passed: retestPassed(value) }
+    return result
   },
 
   hasLeakOfDevice(deviceId) {
@@ -118,15 +192,35 @@ export const useLeakStore = create<LeakState_>((set, get) => ({
   },
 
   async createFromAbnormal(payload) {
-    return get().createLeak({
+    const standard = payload.point
+      ? {
+          standardMin: payload.point.standardMin,
+          standardMax: payload.point.standardMax,
+          standardUnit: payload.point.unit,
+          isCritical: payload.point.isCritical,
+          standardVersionId: payload.point.currentVersionId,
+          standardVersionNo: payload.point.currentVersionNo
+        }
+      : fallbackPpmStandard()
+    const device = await db.devices.get(payload.deviceId)
+    const now = Date.now()
+    const row: LeakRow = {
+      id: createId('lk'),
       deviceId: payload.deviceId,
-      concentrationPpm: payload.concentrationPpm,
+      stationId: device ? device.stationId : payload.stationId,
+      concentrationPpm: Number(payload.concentrationPpm) || 0,
       foundTime: payload.foundTime,
-      measure: payload.measure,
+      measure: payload.measure.trim(),
       state: '待处置',
       retestValuePpm: 0,
-      handler: ''
-    })
+      handler: '',
+      sourceReadingId: payload.sourceReadingId ?? '',
+      ...standard,
+      createdAt: now,
+      updatedAt: now
+    }
+    await db.leaks.put(row)
+    return row
   },
 
   counts() {

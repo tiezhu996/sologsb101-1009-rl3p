@@ -1,7 +1,9 @@
 /** 泄漏处置：由异常读数派发的处置单，复检合格后闭环 */
+import type { StandardRefFields } from '@/types/standard'
+
 export type LeakState = '待处置' | '已处置' | '已复检'
 
-export interface Leak {
+export interface Leak extends StandardRefFields {
   id: string
   deviceId: string
   /** 冗余站点 id */
@@ -15,6 +17,8 @@ export interface Leak {
   /** 复检浓度（ppm） */
   retestValuePpm: number
   handler: string
+  /** 由哪条异常读数派发（手工新建为空串），用于追溯当时判定 */
+  sourceReadingId: string
   createdAt: number
   updatedAt: number
 }

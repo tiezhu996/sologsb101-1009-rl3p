@@ -12,12 +12,21 @@ import {
   deletePointCascade,
   deleteStationCascade,
   readUiPrefs,
-  recalculateReadingsOfPoint,
   writeUiPrefs,
   type DeviceRow,
   type PointRow,
+  type StandardVersionRow,
   type StationRow
 } from '@/utils/db'
+import { initialVersionId } from '@/types/standard'
+import {
+  isStandardChanged,
+  listStandardVersions,
+  normalizeChange,
+  publishStandardVersion,
+  publishStandardVersions,
+  type StandardChange
+} from '@/utils/standards'
 import type { Device, DeviceDraft, DeviceState, DeviceType } from '@/types/device'
 import type { Point, PointDraft, PointFilterState, PointTemplate, StandardDraft } from '@/types/point'
 import { createEmptyPointFilter } from '@/types/point'
@@ -55,13 +64,17 @@ interface StationState {
   updateDevice: (id: string, patch: Partial<DeviceDraft>) => Promise<void>
   removeDevice: (id: string) => Promise<void>
   createPoint: (draft: PointDraft) => Promise<Point>
-  updatePoint: (id: string, patch: Partial<PointDraft>) => Promise<void>
+  /** 更新点位；标准字段变化时发布新版本（不回改历史），其余字段普通更新 */
+  updatePoint: (id: string, patch: Partial<PointDraft>, reason?: string) => Promise<{ point: Point; pendingReadings: number } | null>
   removePoint: (id: string) => Promise<void>
   applyTemplate: (deviceId: string, templates: PointTemplate[]) => Promise<number>
   setStandardDraft: (pointId: string, draft: StandardDraft) => void
   clearStandardDraft: (pointId?: string) => void
-  commitStandardDraft: (pointId: string) => Promise<void>
-  commitAllStandardDrafts: () => Promise<number>
+  /** 提交单个点位标准草稿 → 追加标准版本；返回待复核读数条数 */
+  commitStandardDraft: (pointId: string, reason?: string) => Promise<{ point: Point; pendingReadings: number } | null>
+  /** 批量提交标准草稿；返回发布版本数与待复核读数总数 */
+  commitAllStandardDrafts: (reason?: string) => Promise<{ versionCount: number; pendingReadings: number }>
+  listPointVersions: (pointId: string) => Promise<StandardVersionRow[]>
   devicesOfStation: (stationId: string) => Device[]
   pointsOfDevice: (deviceId: string) => Point[]
   currentStation: () => Station | null
@@ -164,31 +177,81 @@ export const useStationStore = create<StationState>((set, get) => ({
   async createPoint(draft) {
     const now = Date.now()
     const device = await db.devices.get(draft.deviceId)
+    const id = createId('pt')
+    const min = Math.min(Number(draft.standardMin) || 0, Number(draft.standardMax) || 0)
+    const max = Math.max(Number(draft.standardMin) || 0, Number(draft.standardMax) || 0)
     const row: PointRow = {
-      id: createId('pt'),
+      id,
       deviceId: draft.deviceId,
       stationId: device ? device.stationId : '',
       name: draft.name.trim(),
-      standardMin: Number(draft.standardMin) || 0,
-      standardMax: Number(draft.standardMax) || 0,
+      standardMin: min,
+      standardMax: max > min ? max : min + 0.001,
       unit: draft.unit,
       isCritical: draft.isCritical,
+      currentVersionId: initialVersionId(id),
+      currentVersionNo: 1,
       createdAt: now,
       updatedAt: now
     }
-    await db.points.put(row)
+    await db.transaction('rw', [db.points, db.standardVersions], async () => {
+      await db.points.put(row)
+      // 新建点位自带 v1 不可变初始版本
+      await db.standardVersions.put({
+        id: initialVersionId(id),
+        pointId: id,
+        versionNo: 1,
+        standardMin: row.standardMin,
+        standardMax: row.standardMax,
+        standardUnit: row.unit,
+        isCritical: row.isCritical,
+        reason: '初始标准',
+        createdAt: now
+      })
+    })
     return row
   },
 
-  async updatePoint(id, patch) {
-    const next: Partial<PointRow> = { ...patch, updatedAt: Date.now() }
+  async updatePoint(id, patch, reason = '调压站升级') {
+    const point = await db.points.get(id)
+    if (!point) return null
+    const next: Partial<PointRow> = { updatedAt: Date.now() }
     if (patch.name !== undefined) next.name = patch.name.trim()
+    if (patch.unit !== undefined) next.unit = patch.unit
     if (patch.deviceId !== undefined) {
       const device = await db.devices.get(patch.deviceId)
       if (device) next.stationId = device.stationId
     }
-    await db.points.update(id, next)
-    await recalculateReadingsOfPoint(id)
+    const touchesStandard =
+      patch.standardMin !== undefined || patch.standardMax !== undefined || patch.isCritical !== undefined
+    if (touchesStandard) {
+      const normalized = normalizeChange(point, {
+        standardMin: patch.standardMin ?? point.standardMin,
+        standardMax: patch.standardMax ?? point.standardMax,
+        isCritical: patch.isCritical ?? point.isCritical
+      })
+      if (isStandardChanged(point, normalized)) {
+        const result = await publishStandardVersion({ pointId: id, ...normalized }, reason)
+        // 非标准字段（改名 / 调设备 / 单位）在版本事务之外补一次普通更新
+        const plainPatch: Partial<PointRow> = {}
+        if (next.name !== undefined) plainPatch.name = next.name
+        if (next.unit !== undefined) plainPatch.unit = next.unit
+        if (next.stationId !== undefined) plainPatch.stationId = next.stationId
+        if (Object.keys(plainPatch).length > 0) await db.points.update(id, plainPatch)
+        if (result) {
+          const fresh = await db.points.get(id)
+          return fresh ? { point: fresh, pendingReadings: result.pendingReadings } : null
+        }
+      }
+    }
+    // 不涉及标准变化：普通字段更新，历史读数维持原快照，无需重算
+    const plainPatch: Partial<PointRow> = { ...next }
+    delete plainPatch.standardMin
+    delete plainPatch.standardMax
+    delete plainPatch.isCritical
+    if (Object.keys(plainPatch).length > 0) await db.points.update(id, plainPatch)
+    const fresh = await db.points.get(id)
+    return fresh ? { point: fresh, pendingReadings: 0 } : null
   },
 
   async removePoint(id) {
@@ -201,10 +264,11 @@ export const useStationStore = create<StationState>((set, get) => ({
     const stationId = device ? device.stationId : ''
     const existing = get().points.filter((point) => point.deviceId === deviceId).map((point) => point.name)
     const now = Date.now()
-    const rows: PointRow[] = templates
-      .filter((template) => !existing.includes(template.name))
-      .map((template) => ({
-        id: createId('pt'),
+    const chosen = templates.filter((template) => !existing.includes(template.name))
+    const rows: PointRow[] = chosen.map((template, index) => {
+      const id = createId('pt')
+      return {
+        id,
         deviceId,
         stationId,
         name: template.name,
@@ -212,10 +276,30 @@ export const useStationStore = create<StationState>((set, get) => ({
         standardMax: template.standardMax,
         unit: template.unit,
         isCritical: template.isCritical,
-        createdAt: now,
-        updatedAt: now
-      }))
-    if (rows.length > 0) await db.points.bulkPut(rows)
+        currentVersionId: initialVersionId(id),
+        currentVersionNo: 1,
+        createdAt: now + index,
+        updatedAt: now + index
+      }
+    })
+    if (rows.length > 0) {
+      await db.transaction('rw', [db.points, db.standardVersions], async () => {
+        await db.points.bulkPut(rows)
+        await db.standardVersions.bulkPut(
+          rows.map((row) => ({
+            id: initialVersionId(row.id),
+            pointId: row.id,
+            versionNo: 1,
+            standardMin: row.standardMin,
+            standardMax: row.standardMax,
+            standardUnit: row.unit,
+            isCritical: row.isCritical,
+            reason: '初始标准',
+            createdAt: row.createdAt
+          }))
+        )
+      })
+    }
     return rows.length
   },
 
@@ -233,44 +317,42 @@ export const useStationStore = create<StationState>((set, get) => ({
     set({ standardDraft: next })
   },
 
-  async commitStandardDraft(pointId) {
+  async commitStandardDraft(pointId, reason = '调压站升级') {
+    const point = get().points.find((item) => item.id === pointId)
     const draft = get().standardDraft[pointId]
-    if (!draft) return
-    const min = Math.min(draft.standardMin, draft.standardMax)
-    const max = Math.max(draft.standardMin, draft.standardMax)
-    await db.points.update(pointId, {
-      standardMin: min,
-      standardMax: max > min ? max : min + 0.001,
-      isCritical: draft.isCritical,
-      updatedAt: Date.now()
-    })
+    if (!point || !draft) return null
+    const normalized = normalizeChange(point, draft)
+    if (!isStandardChanged(point, normalized)) {
+      get().clearStandardDraft(pointId)
+      return { point, pendingReadings: 0 }
+    }
+    const result = await publishStandardVersion({ pointId, ...normalized }, reason)
     get().clearStandardDraft(pointId)
-    await recalculateReadingsOfPoint(pointId)
+    if (!result) return { point, pendingReadings: 0 }
+    const fresh = get().points.find((item) => item.id === pointId) ?? point
+    return { point: fresh, pendingReadings: result.pendingReadings }
   },
 
-  async commitAllStandardDrafts() {
+  async commitAllStandardDrafts(reason = '调压站升级') {
     const entries = Object.entries(get().standardDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().standardDraft[point.id]
-        const min = Math.min(draft.standardMin, draft.standardMax)
-        const max = Math.max(draft.standardMin, draft.standardMax)
-        return {
-          ...point,
-          standardMin: min,
-          standardMax: max > min ? max : min + 0.001,
-          isCritical: draft.isCritical,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
+    if (entries.length === 0) return { versionCount: 0, pendingReadings: 0 }
+    const changes: StandardChange[] = []
+    entries.forEach(([id, draft]) => {
+      const point = get().points.find((item) => item.id === id)
+      if (!point) return
+      const normalized = normalizeChange(point, draft)
+      if (isStandardChanged(point, normalized)) changes.push({ pointId: id, ...normalized })
+    })
+    const published = await publishStandardVersions(changes, reason)
     get().clearStandardDraft()
-    for (const row of rows) {
-      await recalculateReadingsOfPoint(row.id)
+    return {
+      versionCount: published.length,
+      pendingReadings: published.reduce((sum, result) => sum + result.pendingReadings, 0)
     }
-    return rows.length
+  },
+
+  async listPointVersions(pointId) {
+    return listStandardVersions(pointId)
   },
 
   devicesOfStation(stationId) {

@@ -1,5 +1,7 @@
 /** 点位：设备上的巡检点位与标准值区间 */
-export interface Point {
+import type { PointStandardRef } from '@/types/standard'
+
+export interface Point extends PointStandardRef {
   id: string
   deviceId: string
   /** 冗余站点 id，便于按站点快速筛选 */

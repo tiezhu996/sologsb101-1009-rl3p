@@ -24,6 +24,7 @@ import AbnormalTag from '@/components/common/AbnormalTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import StandardHistoryModal from '@/components/common/StandardHistoryModal'
 import { useStationStore } from '@/stores/stationStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ReadingRow } from '@/utils/db'
@@ -36,7 +37,7 @@ import {
   type PointTemplate
 } from '@/types/point'
 import { DEVICE_TYPES } from '@/types/device'
-import { abnormalLevelOf, deviationPctOf, rangeText } from '@/utils/range'
+import { abnormalLevelOf, rangeText } from '@/utils/range'
 
 export default function PointConfig() {
   const stationStore = useStationStore()
@@ -48,6 +49,8 @@ export default function PointConfig() {
   const [templateOpen, setTemplateOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [checkedTemplates, setCheckedTemplates] = useState<string[]>(POINT_TEMPLATES.map((item) => item.name))
+  const [reason, setReason] = useState('调压站升级')
+  const [historyPoint, setHistoryPoint] = useState<Point | null>(null)
 
   const filter = stationStore.pointFilter
   const filterSelects = useMemo(
@@ -90,9 +93,6 @@ export default function PointConfig() {
     return point.name.toLowerCase().includes(text) || (device ? device.model.toLowerCase().includes(text) : false)
   })
 
-  const abnormalCountOf = (pointId: string): number =>
-    readingTable.rows.filter((row) => row.pointId === pointId && row.isAbnormal).length
-
   const deviceOptions = stationStore.devices
     .filter((device) => !filter.stationId || device.stationId === filter.stationId)
     .map((device) => {
@@ -132,27 +132,35 @@ export default function PointConfig() {
       standardMax: Math.max(values.standardMin, values.standardMax)
     }
     if (editingId) {
-      await stationStore.updatePoint(editingId, payload)
-      Message.success('点位已更新，历史读数偏差率已重算')
+      const result = await stationStore.updatePoint(editingId, payload, reason || '调压站升级')
+      if (result && result.pendingReadings > 0) {
+        Message.success(
+          `点位已更新并生成新版本；${result.pendingReadings} 条未提交巡检读数已标待复核，已完成巡检按当时标准不变`
+        )
+      } else {
+        Message.success('点位已更新；历史读数与处置单仍按当时标准标记，未被改判')
+      }
     } else {
       await stationStore.createPoint(payload)
-      Message.success('点位已创建')
+      Message.success('点位已创建，并生成 v1 初始标准版本')
     }
     setPointOpen(false)
   }
 
   const remove = async (point: Point): Promise<void> => {
     await stationStore.removePoint(point.id)
-    Message.success('点位及其读数已删除')
+    Message.success('点位、读数及其标准版本已删除')
   }
 
   const commitAll = async (): Promise<void> => {
-    const count = await stationStore.commitAllStandardDrafts()
-    if (count === 0) {
-      Message.warning('没有待提交的标准值草稿')
+    const result = await stationStore.commitAllStandardDrafts(reason || '调压站升级')
+    if (result.versionCount === 0) {
+      Message.warning('没有待提交的标准值草稿（或草稿与现行标准一致）')
       return
     }
-    Message.success(`已提交 ${count} 个点位的标准值，历史读数已重算`)
+    Message.success(
+      `已发布 ${result.versionCount} 个点位的新标准版本；${result.pendingReadings} 条未提交巡检读数标待复核，历史已完成数据不变`
+    )
   }
 
   const openTemplate = (): void => {
@@ -190,7 +198,7 @@ export default function PointConfig() {
       }
     },
     {
-      title: '标准区间（可编辑）',
+      title: '新标准（草稿编辑）',
       width: 330,
       render: (_value, record) => {
         const draft = stationStore.standardDraft[record.id]
@@ -232,8 +240,14 @@ export default function PointConfig() {
               size="small"
               disabled={!draft}
               onClick={async () => {
-                await stationStore.commitStandardDraft(record.id)
-                Message.success(`${record.name} 标准值已保存，历史读数已重算`)
+                const result = await stationStore.commitStandardDraft(record.id, reason || '调压站升级')
+                if (result && result.pendingReadings > 0) {
+                  Message.success(
+                    `${record.name} 新标准已发布；${result.pendingReadings} 条未提交巡检读数标待复核，历史数据不变`
+                  )
+                } else {
+                  Message.success(`${record.name} 新标准已发布；已完成巡检与处置单仍按当时标准标记`)
+                }
               }}
             >
               保存
@@ -264,18 +278,33 @@ export default function PointConfig() {
       }
     },
     {
-      title: '标准区间',
+      title: '现行标准',
       width: 160,
       render: (_value, record) => rangeText(record.standardMin, record.standardMax, record.unit)
     },
     {
-      title: '异常读数',
-      width: 170,
+      title: '版本 / 追溯',
+      width: 150,
+      render: (_value, record) => (
+        <Space size={4}>
+          <Tag color="arcoblue" size="small">
+            v{record.currentVersionNo}
+          </Tag>
+          <Button type="text" size="small" onClick={() => setHistoryPoint(record)}>
+            履历
+          </Button>
+        </Space>
+      )
+    },
+    {
+      title: '异常读数（历史口径）',
+      width: 180,
       render: (_value, record) => {
-        const count = abnormalCountOf(record.id)
+        const pointReadings = readingTable.rows.filter((row) => row.pointId === record.id)
+        const count = pointReadings.filter((row) => row.isAbnormal).length
         if (count === 0) return <Tag color="green">无异常</Tag>
-        const worst = readingTable.rows
-          .filter((row) => row.pointId === record.id && row.isAbnormal)
+        const worst = pointReadings
+          .filter((row) => row.isAbnormal)
           .reduce((max, row) => Math.max(max, row.deviationPct), 0)
         return <AbnormalTag level={abnormalLevelOf(worst, record.isCritical)} deviationPct={worst} size="small" />
       }
@@ -310,6 +339,12 @@ export default function PointConfig() {
           </p>
         </div>
         <div className="page-head__actions">
+          <Input
+            style={{ width: 200 }}
+            placeholder="标准变更原因"
+            value={reason}
+            onChange={(value: string) => setReason(value)}
+          />
           <Button onClick={openTemplate}>按模板批量复制</Button>
           <Button disabled={Object.keys(stationStore.standardDraft).length === 0} onClick={commitAll}>
             提交标准值草稿（{Object.keys(stationStore.standardDraft).length}）
@@ -352,7 +387,9 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             点位清单（{rows.length} / {stats.total}）
           </h3>
-          <span className="muted">标准值改动先进入草稿，保存后自动重算历史读数偏差率</span>
+          <span className="muted">
+            保存即发布不可变新版本：已完成巡检与泄漏处置单按当时标准留痕，新标准只管未提交巡检（其读数先标待复核）
+          </span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
@@ -437,10 +474,14 @@ export default function PointConfig() {
             </Checkbox>
           ))}
         </Checkbox.Group>
-        <div className="muted" style={{ marginTop: 10 }}>
-          当前读数平均偏差参考：{deviationPctOf(0.3, 0.18, 0.25).toFixed(2)}%（示例计算）
-        </div>
       </Modal>
+
+      <StandardHistoryModal
+        visible={historyPoint !== null}
+        pointId={historyPoint?.id ?? null}
+        pointName={historyPoint?.name}
+        onClose={() => setHistoryPoint(null)}
+      />
     </div>
   )
 }

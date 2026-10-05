@@ -61,6 +61,8 @@ export function exportReadingCsv(
     '读数',
     '偏差率(%)',
     '判定',
+    '标准版本',
+    '复核状态',
     '备注'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -74,17 +76,19 @@ export function exportReadingCsv(
         station ? station.name : '—',
         device ? `${device.type} ${device.model}` : '—',
         point ? point.name : '—',
-        point ? point.standardMin : '—',
-        point ? point.standardMax : '—',
-        point ? point.unit : '—',
-        point ? (point.isCritical ? '是' : '否') : '—',
+        reading.standardMin,
+        reading.standardMax,
+        reading.standardUnit || (point ? point.unit : '—'),
+        reading.isCritical ? '是' : '否',
         patrol ? patrol.planDate : '—',
         patrol ? patrol.patrolDate || '未执行' : '—',
         patrol ? patrol.patrolman || '—' : '—',
         patrol ? patrol.state : '—',
         reading.value,
         reading.deviationPct.toFixed(2),
-        point ? abnormalLevelOf(reading.deviationPct, point.isCritical) : '—',
+        abnormalLevelOf(reading.deviationPct, reading.isCritical),
+        reading.standardVersionNo ? `v${reading.standardVersionNo}` : '—',
+        reading.reviewState === '待复核' ? '待复核' : '已确认',
         reading.note || '—'
       ]
         .map(csvCell)
@@ -98,7 +102,7 @@ export function exportReadingCsv(
 
 /** 泄漏处置台账 CSV */
 export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Leak[]): string {
-  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人']
+  const header = ['调压站', '设备', '出厂编号', '浓度(ppm)', '当时标准上限(ppm)', '标准版本', '发现时间', '处置措施', '状态', '复检值(ppm)', '复检结论', '处置人']
   const lines: string[] = [header.map(csvCell).join(',')]
   leaks.forEach((leak) => {
     const device = devices.find((item) => item.id === leak.deviceId)
@@ -110,6 +114,8 @@ export function exportLeakCsv(stations: Station[], devices: Device[], leaks: Lea
         device ? `${device.type} ${device.model}` : '—',
         device ? device.serialNo : '—',
         leak.concentrationPpm,
+        leak.standardMax,
+        leak.standardVersionNo ? `v${leak.standardVersionNo}` : '—',
         leak.foundTime,
         leak.measure || '—',
         leak.state,
